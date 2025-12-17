@@ -257,65 +257,54 @@ class BybitTrader:
             return None
 
     def place_tp_sl(self, symbol, side, entry_price, quantity):
-        """Place Take Profit and Stop Loss orders"""
+        """Place Take Profit and Stop Loss using Bybit's position TP/SL"""
         try:
             if side == 'buy':  # Long position
                 tp_price = entry_price * (1 + TP_PERCENT / 100)
                 sl_price = entry_price * (1 - SL_PERCENT / 100)
-                close_side = 'sell'
+                position_side = 'Buy'
             else:  # Short position
                 tp_price = entry_price * (1 - TP_PERCENT / 100)
                 sl_price = entry_price * (1 + SL_PERCENT / 100)
-                close_side = 'buy'
+                position_side = 'Sell'
 
             # Round prices
             market = self.exchange.market(symbol)
             price_precision = market.get('precision', {}).get('price', 2)
+            if isinstance(price_precision, float):
+                price_precision = int(price_precision) if price_precision > 0 else 2
             tp_price = round(tp_price, price_precision)
             sl_price = round(sl_price, price_precision)
 
-            # Place TP order (reduce-only limit order)
-            tp_order = self.exchange.create_order(
-                symbol=symbol,
-                type='limit',
-                side=close_side,
-                amount=quantity,
-                price=tp_price,
-                params={'reduceOnly': True, 'timeInForce': 'GTC'}
-            )
-            print(f"✅ TP order placed at ${tp_price}")
+            # Get the Bybit symbol format
+            bybit_symbol = symbol.replace('/USDT:USDT', 'USDT').replace(':USDT', '')
 
-            # Place SL order (stop market)
-            sl_order = self.exchange.create_order(
-                symbol=symbol,
-                type='market',
-                side=close_side,
-                amount=quantity,
-                params={
-                    'reduceOnly': True,
-                    'stopLoss': {'triggerPrice': sl_price, 'type': 'market'}
-                }
-            )
-            print(f"✅ SL order placed at ${sl_price}")
+            print(f"📊 Setting TP: ${tp_price} / SL: ${sl_price} for {bybit_symbol}")
 
-            return {'tp': tp_order, 'sl': sl_order, 'tp_price': tp_price, 'sl_price': sl_price}
+            # Use Bybit's set_trading_stop API
+            response = self.exchange.private_post_v5_position_trading_stop({
+                'category': 'linear',
+                'symbol': bybit_symbol,
+                'takeProfit': str(tp_price),
+                'stopLoss': str(sl_price),
+                'tpTriggerBy': 'LastPrice',
+                'slTriggerBy': 'LastPrice',
+                'tpslMode': 'Full',
+                'positionIdx': 0,  # One-way mode
+            })
+
+            if response.get('retCode') == 0:
+                print(f"✅ TP/SL set: TP=${tp_price} | SL=${sl_price}")
+                return {'tp_price': tp_price, 'sl_price': sl_price}
+            else:
+                print(f"⚠️ TP/SL response: {response}")
+                return {'tp_price': tp_price, 'sl_price': sl_price}
+
         except Exception as e:
             print(f"❌ TP/SL placement failed: {e}")
-            # Try alternative method for stop loss
-            try:
-                sl_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type='stop',
-                    side=close_side,
-                    amount=quantity,
-                    price=sl_price,
-                    params={'reduceOnly': True, 'triggerPrice': sl_price}
-                )
-                print(f"✅ SL order placed (alternative method) at ${sl_price}")
-                return {'tp': tp_order if 'tp_order' in dir() else None, 'sl': sl_order, 'sl_price': sl_price}
-            except Exception as e2:
-                print(f"❌ Alternative SL also failed: {e2}")
-                return None
+            # Return prices anyway for display
+            return {'tp_price': tp_price if 'tp_price' in dir() else None,
+                    'sl_price': sl_price if 'sl_price' in dir() else None}
 
     def execute_signal_trade(self, symbol, signal_type, price=None):
         """Execute a trade based on signal with TP/SL"""
@@ -331,10 +320,22 @@ class BybitTrader:
             if not order:
                 return None, "Market order failed"
 
-            # Get fill price
-            entry_price = float(order.get('average') or order.get('price') or price)
-            if not entry_price:
+            # Get fill price (try multiple sources)
+            entry_price = None
+            if order.get('average'):
+                entry_price = float(order['average'])
+            elif order.get('price'):
+                entry_price = float(order['price'])
+            elif price:
+                entry_price = float(price)
+            else:
+                # Fallback: get current market price
                 entry_price = self.get_ticker_price(symbol)
+
+            if not entry_price:
+                return None, "Could not determine entry price"
+
+            print(f"✅ Order filled at ${entry_price:.4f}")
 
             # Place TP/SL
             tp_sl = self.place_tp_sl(symbol, side, entry_price, quantity)
