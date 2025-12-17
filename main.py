@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Bybit VWAP Strategy Monitor
-Monitors top 20 OI USDT perpetual futures and sends Telegram signals
+Bybit VWAP Strategy Monitor with Trading
+Monitors top 20 OI USDT perpetual futures, sends Telegram signals,
+and supports market order execution with TP/SL
 """
 
 import os
@@ -10,7 +11,8 @@ import asyncio
 import threading
 import http.server
 import socketserver
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import pytz
 import numpy as np
@@ -32,6 +34,13 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY', '')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET', '')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# Trading Settings
+LEVERAGE = int(os.getenv('LEVERAGE', '20'))
+ORDER_SIZE_USDT = float(os.getenv('ORDER_SIZE_USDT', '100'))  # Position size in USDT
+TP_PERCENT = float(os.getenv('TP_PERCENT', '1.5'))  # Take Profit %
+SL_PERCENT = float(os.getenv('SL_PERCENT', '0.75'))  # Stop Loss %
+POSITION_CHECK_INTERVAL = int(os.getenv('POSITION_CHECK_INTERVAL', '10'))  # seconds
 
 # Monitor Settings
 TIMEFRAMES = os.getenv('TIMEFRAMES', '3m,5m,15m').split(',')
@@ -122,6 +131,281 @@ def send_telegram_photo(photo_path, caption=""):
                 print(f"❌ Telegram photo error: {response.text}")
     except Exception as e:
         print(f"❌ Telegram photo send failed: {e}")
+
+
+def send_telegram_with_buttons(message, buttons):
+    """Send message with inline keyboard buttons to Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured")
+        return None
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    keyboard = {"inline_keyboard": buttons}
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'reply_markup': json.dumps(keyboard)
+    }
+
+    try:
+        response = requests.post(url, data=payload, timeout=10)
+        if response.status_code == 200:
+            return response.json().get('result', {}).get('message_id')
+        else:
+            print(f"❌ Telegram error: {response.text}")
+            return None
+    except Exception as e:
+        print(f"❌ Telegram send failed: {e}")
+        return None
+
+
+class BybitTrader:
+    """Bybit trading client with TP/SL support"""
+
+    def __init__(self):
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            raise ValueError("API keys not configured!")
+
+        self.exchange = ccxt.bybit({
+            'apiKey': BYBIT_API_KEY,
+            'secret': BYBIT_API_SECRET,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'linear'}
+        })
+        self.positions = {}  # Track open positions
+        self.pending_signals = {}  # Signals waiting for user action
+
+    def set_leverage(self, symbol, leverage=LEVERAGE):
+        """Set leverage for a symbol"""
+        try:
+            # Convert symbol format (BTC/USDT:USDT -> BTCUSDT)
+            market_symbol = symbol.replace('/USDT:USDT', 'USDT').replace(':USDT', '')
+
+            self.exchange.set_leverage(leverage, symbol)
+            print(f"✅ Leverage set to {leverage}x for {market_symbol}")
+            return True
+        except Exception as e:
+            # Leverage might already be set
+            if 'leverage not modified' in str(e).lower():
+                return True
+            print(f"⚠️ Leverage setting: {e}")
+            return True  # Continue anyway
+
+    def get_ticker_price(self, symbol):
+        """Get current price for a symbol"""
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            return ticker['last']
+        except Exception as e:
+            print(f"❌ Error getting price for {symbol}: {e}")
+            return None
+
+    def calculate_quantity(self, symbol, usdt_amount):
+        """Calculate order quantity based on USDT amount"""
+        try:
+            price = self.get_ticker_price(symbol)
+            if not price:
+                return None
+
+            # Get market info for precision
+            market = self.exchange.market(symbol)
+            min_qty = market.get('limits', {}).get('amount', {}).get('min', 0.001)
+            precision = market.get('precision', {}).get('amount', 3)
+
+            # Calculate quantity
+            quantity = (usdt_amount * LEVERAGE) / price
+
+            # Round to precision
+            quantity = round(quantity, precision)
+
+            # Ensure minimum quantity
+            if quantity < min_qty:
+                quantity = min_qty
+
+            return quantity
+        except Exception as e:
+            print(f"❌ Error calculating quantity: {e}")
+            return None
+
+    def place_market_order(self, symbol, side, quantity):
+        """Place market order"""
+        try:
+            self.set_leverage(symbol)
+
+            order = self.exchange.create_market_order(
+                symbol=symbol,
+                side=side,  # 'buy' or 'sell'
+                amount=quantity
+            )
+            print(f"✅ Market {side.upper()} order placed: {symbol} qty={quantity}")
+            return order
+        except Exception as e:
+            print(f"❌ Order failed: {e}")
+            return None
+
+    def place_tp_sl(self, symbol, side, entry_price, quantity):
+        """Place Take Profit and Stop Loss orders"""
+        try:
+            if side == 'buy':  # Long position
+                tp_price = entry_price * (1 + TP_PERCENT / 100)
+                sl_price = entry_price * (1 - SL_PERCENT / 100)
+                close_side = 'sell'
+            else:  # Short position
+                tp_price = entry_price * (1 - TP_PERCENT / 100)
+                sl_price = entry_price * (1 + SL_PERCENT / 100)
+                close_side = 'buy'
+
+            # Round prices
+            market = self.exchange.market(symbol)
+            price_precision = market.get('precision', {}).get('price', 2)
+            tp_price = round(tp_price, price_precision)
+            sl_price = round(sl_price, price_precision)
+
+            # Place TP order (reduce-only limit order)
+            tp_order = self.exchange.create_order(
+                symbol=symbol,
+                type='limit',
+                side=close_side,
+                amount=quantity,
+                price=tp_price,
+                params={'reduceOnly': True, 'timeInForce': 'GTC'}
+            )
+            print(f"✅ TP order placed at ${tp_price}")
+
+            # Place SL order (stop market)
+            sl_order = self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=close_side,
+                amount=quantity,
+                params={
+                    'reduceOnly': True,
+                    'stopLoss': {'triggerPrice': sl_price, 'type': 'market'}
+                }
+            )
+            print(f"✅ SL order placed at ${sl_price}")
+
+            return {'tp': tp_order, 'sl': sl_order, 'tp_price': tp_price, 'sl_price': sl_price}
+        except Exception as e:
+            print(f"❌ TP/SL placement failed: {e}")
+            # Try alternative method for stop loss
+            try:
+                sl_order = self.exchange.create_order(
+                    symbol=symbol,
+                    type='stop',
+                    side=close_side,
+                    amount=quantity,
+                    price=sl_price,
+                    params={'reduceOnly': True, 'triggerPrice': sl_price}
+                )
+                print(f"✅ SL order placed (alternative method) at ${sl_price}")
+                return {'tp': tp_order if 'tp_order' in dir() else None, 'sl': sl_order, 'sl_price': sl_price}
+            except Exception as e2:
+                print(f"❌ Alternative SL also failed: {e2}")
+                return None
+
+    def execute_signal_trade(self, symbol, signal_type, price=None):
+        """Execute a trade based on signal with TP/SL"""
+        try:
+            side = 'buy' if signal_type == 'LONG' else 'sell'
+            quantity = self.calculate_quantity(symbol, ORDER_SIZE_USDT)
+
+            if not quantity:
+                return None, "Failed to calculate quantity"
+
+            # Place market order
+            order = self.place_market_order(symbol, side, quantity)
+            if not order:
+                return None, "Market order failed"
+
+            # Get fill price
+            entry_price = float(order.get('average') or order.get('price') or price)
+            if not entry_price:
+                entry_price = self.get_ticker_price(symbol)
+
+            # Place TP/SL
+            tp_sl = self.place_tp_sl(symbol, side, entry_price, quantity)
+
+            # Track position
+            self.positions[symbol] = {
+                'side': signal_type,
+                'entry_price': entry_price,
+                'quantity': quantity,
+                'entry_time': datetime.now(timezone.utc),
+                'tp_price': tp_sl.get('tp_price') if tp_sl else None,
+                'sl_price': tp_sl.get('sl_price') if tp_sl else None
+            }
+
+            return {
+                'order': order,
+                'entry_price': entry_price,
+                'quantity': quantity,
+                'tp_sl': tp_sl
+            }, None
+
+        except Exception as e:
+            return None, str(e)
+
+    def get_positions(self):
+        """Get all open positions"""
+        try:
+            positions = self.exchange.fetch_positions()
+            open_positions = []
+            for pos in positions:
+                if float(pos.get('contracts', 0)) > 0:
+                    open_positions.append({
+                        'symbol': pos['symbol'],
+                        'side': pos['side'],
+                        'size': pos['contracts'],
+                        'entry_price': pos['entryPrice'],
+                        'mark_price': pos['markPrice'],
+                        'unrealized_pnl': pos['unrealizedPnl'],
+                        'leverage': pos['leverage'],
+                        'liquidation_price': pos.get('liquidationPrice')
+                    })
+            return open_positions
+        except Exception as e:
+            print(f"❌ Error fetching positions: {e}")
+            return []
+
+    def close_position(self, symbol, side=None):
+        """Close a position"""
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            for pos in positions:
+                if float(pos.get('contracts', 0)) > 0:
+                    close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                    order = self.exchange.create_market_order(
+                        symbol=symbol,
+                        side=close_side,
+                        amount=pos['contracts'],
+                        params={'reduceOnly': True}
+                    )
+                    if symbol in self.positions:
+                        del self.positions[symbol]
+                    return order
+            return None
+        except Exception as e:
+            print(f"❌ Error closing position: {e}")
+            return None
+
+
+# Global trader instance
+trader = None
+
+
+def init_trader():
+    """Initialize global trader instance"""
+    global trader
+    try:
+        trader = BybitTrader()
+        print(f"✅ Trader initialized with {LEVERAGE}x leverage")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to initialize trader: {e}")
+        return False
 
 
 def generate_chart(df, symbol, timeframe, signal=None, save_path=None):
@@ -594,9 +878,46 @@ class BybitMonitor:
 <b>Vol Ratio:</b> {signal['vol_ratio']:.2f}
 {rr_line}
 
+<b>Leverage:</b> {LEVERAGE}x | <b>Size:</b> ${ORDER_SIZE_USDT}
+<b>Auto TP:</b> {TP_PERCENT}% | <b>Auto SL:</b> {SL_PERCENT}%
+
 <i>Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
 """
         return message
+
+    def send_signal_with_buttons(self, symbol, timeframe, signal, chart_path=None):
+        """Send signal with trade execution buttons"""
+        message = self.format_signal_message(symbol, timeframe, signal)
+
+        # Create inline keyboard buttons
+        clean_symbol = symbol.replace(':USDT', '').replace('/USDT', '')
+        signal_type = signal['type']
+
+        buttons = [
+            [
+                {"text": f"🚀 {signal_type} NOW", "callback_data": f"trade_{clean_symbol}_{signal_type}"},
+                {"text": "❌ Skip", "callback_data": f"skip_{clean_symbol}"}
+            ]
+        ]
+
+        if chart_path:
+            # Send photo with caption first, then buttons separately
+            send_telegram_photo(chart_path, message)
+            # Send buttons as a follow-up message
+            button_msg = f"👆 <b>Execute {signal_type} for {clean_symbol}?</b>"
+            send_telegram_with_buttons(button_msg, buttons)
+        else:
+            send_telegram_with_buttons(message, buttons)
+
+        # Store pending signal for callback handler
+        if trader:
+            trader.pending_signals[clean_symbol] = {
+                'symbol': symbol,
+                'signal_type': signal_type,
+                'price': signal['price'],
+                'timeframe': timeframe,
+                'timestamp': time.time()
+            }
     
     async def check_symbol(self, symbol):
         """Check a symbol across all timeframes"""
@@ -647,10 +968,8 @@ class BybitMonitor:
                         print(f"   Target: None (Exit Mode: {signal['exit_mode']})")
                     print(f"{'='*60}\n")
 
-                    # Format signal message
-                    message = self.format_signal_message(symbol, timeframe, signal)
-
-                    # Generate and send chart with message as caption
+                    # Generate and send chart with message and trade buttons
+                    chart_path = None
                     if SEND_CHART:
                         try:
                             # Calculate VWAP data for chart
@@ -660,16 +979,12 @@ class BybitMonitor:
 
                             # Generate chart
                             chart_path = generate_chart(df_chart, symbol, timeframe, signal)
-
-                            # Send chart with full message as caption
-                            send_telegram_photo(chart_path, message)
                         except Exception as chart_err:
                             print(f"⚠️ Chart generation failed: {chart_err}")
-                            # Fallback to text-only
-                            send_telegram(message)
-                    else:
-                        # No chart, send text only
-                        send_telegram(message)
+                            chart_path = None
+
+                    # Send signal with trade buttons
+                    self.send_signal_with_buttons(symbol, timeframe, signal, chart_path)
 
                     # Add to signal history for HTML viewer
                     self.add_signal_to_history(symbol, timeframe, signal['type'])
@@ -782,21 +1097,313 @@ Exit Mode Short: {EXIT_MODE_SHORT}""")
                 await asyncio.sleep(CHECK_INTERVAL)
 
 
+class TelegramBotHandler:
+    """Handle Telegram bot callbacks and commands"""
+
+    def __init__(self):
+        self.last_update_id = 0
+        self.running = True
+
+    def get_updates(self):
+        """Get updates from Telegram"""
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {
+            'offset': self.last_update_id + 1,
+            'timeout': 5,
+            'allowed_updates': ['callback_query', 'message']
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('result', [])
+        except Exception as e:
+            print(f"⚠️ Error getting Telegram updates: {e}")
+        return []
+
+    def answer_callback(self, callback_id, text):
+        """Answer callback query"""
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        try:
+            requests.post(url, data={'callback_query_id': callback_id, 'text': text}, timeout=5)
+        except Exception as e:
+            print(f"⚠️ Error answering callback: {e}")
+
+    def handle_callback(self, callback_data, callback_id):
+        """Handle button callback"""
+        global trader
+
+        if callback_data.startswith('trade_'):
+            # Parse: trade_BTCUSDT_LONG
+            parts = callback_data.split('_')
+            if len(parts) >= 3:
+                symbol_short = parts[1]
+                signal_type = parts[2]
+
+                # Find full symbol
+                symbol = f"{symbol_short}/USDT:USDT"
+
+                self.answer_callback(callback_id, f"Executing {signal_type}...")
+
+                if trader:
+                    # Execute trade
+                    result, error = trader.execute_signal_trade(symbol, signal_type)
+
+                    if result:
+                        entry = result['entry_price']
+                        qty = result['quantity']
+                        tp_price = result['tp_sl'].get('tp_price') if result['tp_sl'] else None
+                        sl_price = result['tp_sl'].get('sl_price') if result['tp_sl'] else None
+
+                        msg = f"""✅ <b>Order Executed!</b>
+
+<b>Symbol:</b> {symbol_short}
+<b>Side:</b> {signal_type}
+<b>Entry:</b> ${entry:.4f}
+<b>Quantity:</b> {qty}
+<b>Leverage:</b> {LEVERAGE}x
+
+<b>TP:</b> ${tp_price:.4f} (+{TP_PERCENT}%)
+<b>SL:</b> ${sl_price:.4f} (-{SL_PERCENT}%)
+
+<i>Position monitoring active</i>"""
+                        send_telegram(msg)
+                    else:
+                        send_telegram(f"❌ <b>Order Failed</b>\n\n{error}")
+                else:
+                    send_telegram("❌ Trader not initialized!")
+
+        elif callback_data.startswith('skip_'):
+            symbol_short = callback_data.split('_')[1]
+            self.answer_callback(callback_id, f"Skipped {symbol_short}")
+            send_telegram(f"⏭️ Skipped signal for {symbol_short}")
+
+        elif callback_data.startswith('close_'):
+            # Close position: close_BTCUSDT
+            symbol_short = callback_data.split('_')[1]
+            symbol = f"{symbol_short}/USDT:USDT"
+
+            self.answer_callback(callback_id, "Closing position...")
+
+            if trader:
+                order = trader.close_position(symbol)
+                if order:
+                    send_telegram(f"✅ Position closed for {symbol_short}")
+                else:
+                    send_telegram(f"❌ Failed to close {symbol_short}")
+
+    def handle_message(self, text):
+        """Handle text commands"""
+        global trader
+
+        text = text.strip().lower()
+
+        if text == '/positions' or text == '/pos':
+            if trader:
+                positions = trader.get_positions()
+                if positions:
+                    msg = "📊 <b>Open Positions</b>\n\n"
+                    for pos in positions:
+                        pnl = float(pos['unrealized_pnl']) if pos['unrealized_pnl'] else 0
+                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                        msg += f"<b>{pos['symbol'].replace('/USDT:USDT', '')}</b>\n"
+                        msg += f"  Side: {pos['side'].upper()}\n"
+                        msg += f"  Size: {pos['size']}\n"
+                        msg += f"  Entry: ${float(pos['entry_price']):.4f}\n"
+                        msg += f"  Mark: ${float(pos['mark_price']):.4f}\n"
+                        msg += f"  {pnl_emoji} PnL: ${pnl:.2f}\n\n"
+                    send_telegram(msg)
+                else:
+                    send_telegram("📊 No open positions")
+            else:
+                send_telegram("❌ Trader not initialized")
+
+        elif text == '/help':
+            help_msg = """📖 <b>Commands</b>
+
+/positions - Show open positions
+/close [SYMBOL] - Close position (e.g., /close BTCUSDT)
+/balance - Show account balance
+/help - Show this help
+
+<b>Button Actions:</b>
+🚀 LONG/SHORT - Execute market order
+❌ Skip - Ignore signal
+🔴 Close - Close position"""
+            send_telegram(help_msg)
+
+        elif text.startswith('/close '):
+            symbol_short = text.replace('/close ', '').upper()
+            symbol = f"{symbol_short}/USDT:USDT"
+            if trader:
+                order = trader.close_position(symbol)
+                if order:
+                    send_telegram(f"✅ Closed position for {symbol_short}")
+                else:
+                    send_telegram(f"❌ No position found for {symbol_short}")
+
+        elif text == '/balance':
+            if trader:
+                try:
+                    balance = trader.exchange.fetch_balance()
+                    usdt = balance.get('USDT', {})
+                    total = usdt.get('total', 0)
+                    free = usdt.get('free', 0)
+                    used = usdt.get('used', 0)
+                    send_telegram(f"""💰 <b>Account Balance</b>
+
+<b>Total:</b> ${total:.2f}
+<b>Available:</b> ${free:.2f}
+<b>In Use:</b> ${used:.2f}""")
+                except Exception as e:
+                    send_telegram(f"❌ Error fetching balance: {e}")
+
+    async def poll_updates(self):
+        """Poll for Telegram updates"""
+        print("📱 Telegram bot handler started")
+
+        while self.running:
+            try:
+                updates = self.get_updates()
+
+                for update in updates:
+                    self.last_update_id = update.get('update_id', self.last_update_id)
+
+                    # Handle callback query (button press)
+                    if 'callback_query' in update:
+                        callback = update['callback_query']
+                        callback_data = callback.get('data', '')
+                        callback_id = callback.get('id')
+                        self.handle_callback(callback_data, callback_id)
+
+                    # Handle text message
+                    elif 'message' in update:
+                        message = update['message']
+                        text = message.get('text', '')
+                        chat_id = str(message.get('chat', {}).get('id', ''))
+
+                        # Only handle messages from configured chat
+                        if chat_id == TELEGRAM_CHAT_ID and text:
+                            self.handle_message(text)
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                print(f"⚠️ Telegram poll error: {e}")
+                await asyncio.sleep(5)
+
+
+async def position_monitor():
+    """Monitor open positions and send updates"""
+    global trader
+
+    print("📈 Position monitor started")
+
+    last_report_time = 0
+    report_interval = 60  # Report positions every 60 seconds
+
+    while True:
+        try:
+            if trader:
+                positions = trader.get_positions()
+
+                current_time = time.time()
+
+                # Send periodic position updates if there are open positions
+                if positions and (current_time - last_report_time) >= report_interval:
+                    msg = "📊 <b>Position Update</b>\n\n"
+
+                    for pos in positions:
+                        pnl = float(pos['unrealized_pnl']) if pos['unrealized_pnl'] else 0
+                        entry_price = float(pos['entry_price']) if pos['entry_price'] else 0
+                        mark_price = float(pos['mark_price']) if pos['mark_price'] else 0
+
+                        # Calculate PnL percentage
+                        if entry_price > 0:
+                            if pos['side'] == 'long':
+                                pnl_pct = ((mark_price - entry_price) / entry_price) * 100 * LEVERAGE
+                            else:
+                                pnl_pct = ((entry_price - mark_price) / entry_price) * 100 * LEVERAGE
+                        else:
+                            pnl_pct = 0
+
+                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                        symbol_short = pos['symbol'].replace('/USDT:USDT', '').replace(':USDT', '')
+
+                        msg += f"<b>{symbol_short}</b> ({pos['side'].upper()})\n"
+                        msg += f"  Entry: ${entry_price:.4f}\n"
+                        msg += f"  Current: ${mark_price:.4f}\n"
+                        msg += f"  {pnl_emoji} PnL: ${pnl:.2f} ({pnl_pct:+.2f}%)\n"
+
+                        if pos.get('liquidation_price'):
+                            msg += f"  ⚠️ Liq: ${float(pos['liquidation_price']):.4f}\n"
+                        msg += "\n"
+
+                    # Add close buttons
+                    buttons = []
+                    for pos in positions:
+                        symbol_short = pos['symbol'].replace('/USDT:USDT', '').replace(':USDT', '')
+                        buttons.append([
+                            {"text": f"🔴 Close {symbol_short}", "callback_data": f"close_{symbol_short}"}
+                        ])
+
+                    send_telegram_with_buttons(msg, buttons)
+                    last_report_time = current_time
+
+            await asyncio.sleep(POSITION_CHECK_INTERVAL)
+
+        except Exception as e:
+            print(f"⚠️ Position monitor error: {e}")
+            await asyncio.sleep(POSITION_CHECK_INTERVAL)
+
+
 async def main():
     """Entry point"""
+    global trader
+
     # Check configuration
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("❌ ERROR: Telegram configuration missing!")
         print("Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env file")
         return
 
+    # Initialize trader
+    if BYBIT_API_KEY and BYBIT_API_SECRET:
+        init_trader()
+    else:
+        print("⚠️ Trading disabled - no API keys configured")
+
     # Start chart viewer server in background
     if SEND_CHART:
         server_thread = threading.Thread(target=start_chart_server, daemon=True)
         server_thread.start()
 
+    # Create tasks
     monitor = BybitMonitor()
-    await monitor.monitor()
+    telegram_handler = TelegramBotHandler()
+
+    # Send startup message
+    startup_msg = f"""🚀 <b>Bybit VWAP Monitor Started</b>
+
+Monitoring top {TOP_OI_COUNT} OI symbols
+Timeframes: {', '.join(TIMEFRAMES)}
+Check Interval: {CHECK_INTERVAL}s
+
+<b>Trading Settings:</b>
+Leverage: {LEVERAGE}x
+Order Size: ${ORDER_SIZE_USDT}
+TP: {TP_PERCENT}% | SL: {SL_PERCENT}%
+
+<i>Send /help for commands</i>"""
+    send_telegram(startup_msg)
+
+    # Run all tasks concurrently
+    await asyncio.gather(
+        monitor.monitor(),
+        telegram_handler.poll_updates(),
+        position_monitor()
+    )
 
 
 if __name__ == "__main__":
