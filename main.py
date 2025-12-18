@@ -54,7 +54,6 @@ TOP_OI_COUNT = int(os.getenv('TOP_OI_COUNT', '20'))
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '60'))
 
 # VWAP Strategy Parameters
-STOP_POINTS = float(os.getenv('STOP_POINTS', '20.0'))
 BAND_ENTRY_MULT = float(os.getenv('BAND_ENTRY_MULT', '2.0'))
 
 # Exit Mode: "VWAP", "Deviation Band", or "None"
@@ -498,6 +497,22 @@ class BybitTrader:
         try:
             bybit_symbol = symbol.replace('/USDT:USDT', 'USDT').replace(':USDT', '')
 
+            # If no TP provided, fetch from Bybit to preserve it
+            if current_tp is None:
+                try:
+                    response = self.exchange.private_get_v5_position_list({
+                        'category': 'linear',
+                        'symbol': bybit_symbol
+                    })
+                    if response.get('retCode') == 0:
+                        pos_list = response.get('result', {}).get('list', [])
+                        if pos_list:
+                            current_tp = pos_list[0].get('takeProfit')
+                            if current_tp:
+                                current_tp = float(current_tp)
+                except Exception as e:
+                    print(f"⚠️ Could not fetch current TP: {e}")
+
             params = {
                 'category': 'linear',
                 'symbol': bybit_symbol,
@@ -507,7 +522,7 @@ class BybitTrader:
                 'positionIdx': 0,
             }
 
-            if current_tp is not None:
+            if current_tp is not None and float(current_tp) > 0:
                 params['takeProfit'] = str(current_tp)
                 params['tpTriggerBy'] = 'LastPrice'
 
@@ -841,7 +856,6 @@ class VWAPStrategy:
         }
 
         if is_h1h2:
-            stop_loss = current['low'] - STOP_POINTS
             # Target based on exit mode
             if EXIT_MODE_LONG == 'VWAP':
                 target = current['vwap']
@@ -852,7 +866,7 @@ class VWAPStrategy:
             return {
                 'type': 'LONG',
                 'price': current['close'],
-                'stop_loss': stop_loss,
+                'stop_loss': None,  # Will use swing-based SL
                 'target': target,
                 'exit_mode': EXIT_MODE_LONG,
                 'vwap': current['vwap'],
@@ -862,7 +876,6 @@ class VWAPStrategy:
             }
 
         if is_l1l2:
-            stop_loss = current['high'] + STOP_POINTS
             # Target based on exit mode
             if EXIT_MODE_SHORT == 'VWAP':
                 target = current['vwap']
@@ -873,7 +886,7 @@ class VWAPStrategy:
             return {
                 'type': 'SHORT',
                 'price': current['close'],
-                'stop_loss': stop_loss,
+                'stop_loss': None,  # Will use swing-based SL
                 'target': target,
                 'exit_mode': EXIT_MODE_SHORT,
                 'vwap': current['vwap'],
@@ -995,11 +1008,8 @@ class BybitMonitor:
         exit_mode = signal.get('exit_mode', 'VWAP')
         if signal['target'] is not None:
             target_line = f"<b>Target ({exit_mode}):</b> ${signal['target']:.4f}"
-            rr = abs(signal['price'] - signal['target']) / abs(signal['price'] - signal['stop_loss'])
-            rr_line = f"<i>Risk/Reward:</i> {rr:.2f}"
         else:
             target_line = f"<b>Target:</b> None (Exit Mode: {exit_mode})"
-            rr_line = ""
 
         message = f"""
 {emoji} <b>{signal_type} SIGNAL</b> {emoji}
@@ -1007,15 +1017,13 @@ class BybitMonitor:
 <b>Symbol:</b> {symbol.replace(':USDT', '')}
 <b>Timeframe:</b> {timeframe}
 <b>Entry:</b> ${signal['price']:.4f}
-<b>Stop Loss:</b> ${signal['stop_loss']:.4f}
 {target_line}
 
 <b>Signal Strength:</b> {signal['strength']:.2%}
 <b>Vol Ratio:</b> {signal['vol_ratio']:.2f}
-{rr_line}
 
 <b>Leverage:</b> {LEVERAGE}x | <b>Size:</b> ${ORDER_SIZE_USDT}
-<b>TP:</b> VWAP target | <b>SL:</b> Trailing (1m swing)
+<b>TP:</b> VWAP | <b>SL:</b> Swing trailing
 
 <i>Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</i>
 """
@@ -1052,7 +1060,6 @@ class BybitMonitor:
                 'signal_type': signal_type,
                 'price': signal['price'],
                 'target': signal.get('target'),  # VWAP target for TP
-                'stop_loss': signal.get('stop_loss'),  # Initial SL
                 'timeframe': timeframe,
                 'timestamp': time.time()
             }
@@ -1099,11 +1106,11 @@ class BybitMonitor:
                     print(f"🎯 SIGNAL DETECTED: {symbol} ({timeframe})")
                     print(f"   Type: {signal['type']}")
                     print(f"   Entry: ${signal['price']:.4f}")
-                    print(f"   Stop: ${signal['stop_loss']:.4f}")
+                    print(f"   SL: Swing-based (trailing)")
                     if signal['target'] is not None:
-                        print(f"   Target ({signal['exit_mode']}): ${signal['target']:.4f}")
+                        print(f"   TP ({signal['exit_mode']}): ${signal['target']:.4f}")
                     else:
-                        print(f"   Target: None (Exit Mode: {signal['exit_mode']})")
+                        print(f"   TP: None (Exit Mode: {signal['exit_mode']})")
                     print(f"{'='*60}\n")
 
                     # Generate and send chart with message and trade buttons
@@ -1143,7 +1150,7 @@ class BybitMonitor:
         print(f"\n📋 Strategy Parameters:")
         print(f"   Session Timezone: {SESSION_TIMEZONE} (VWAP resets at 00:00 {SESSION_TIMEZONE})")
         print(f"   Display Timezone: {DISPLAY_TIMEZONE} (chart x-axis)")
-        print(f"   Stop Points: {STOP_POINTS}")
+        print(f"   SL: Swing-based (trailing)")
         print(f"   Band Entry Mult: {BAND_ENTRY_MULT}")
         print(f"   Exit Mode Long: {EXIT_MODE_LONG}")
         print(f"   Exit Mode Short: {EXIT_MODE_SHORT}")
@@ -1285,26 +1292,25 @@ class TelegramBotHandler:
                 self.answer_callback(callback_id, f"Executing {signal_type}...")
 
                 if trader:
-                    # Get pending signal with TP/SL values
+                    # Get pending signal with TP target
                     pending = trader.pending_signals.get(symbol_short, {})
                     tp_target = pending.get('target')  # VWAP target
-                    sl_initial = pending.get('stop_loss')  # Initial SL
+                    print(f"🔍 DEBUG tp_target={tp_target}")
 
-                    # Execute trade with signal's TP/SL
+                    # Execute trade (SL will be swing-based)
                     result, error = trader.execute_signal_trade(
                         symbol, signal_type,
-                        tp_target=tp_target,
-                        sl_initial=sl_initial
+                        tp_target=tp_target
                     )
 
                     if result:
                         entry = result['entry_price']
                         qty = result['quantity']
                         tp_price = result['tp_sl'].get('tp_price') if result['tp_sl'] else tp_target
-                        sl_price = result['tp_sl'].get('sl_price') if result['tp_sl'] else sl_initial
+                        sl_price = result['tp_sl'].get('sl_price') if result['tp_sl'] else None
 
                         tp_str = f"${tp_price:.4f} (VWAP)" if tp_price else "Not set"
-                        sl_str = f"${sl_price:.4f} (trailing)" if sl_price else "Not set"
+                        sl_str = f"${sl_price:.4f} (swing)" if sl_price else "Swing-based"
 
                         msg = f"""✅ <b>Order Executed!</b>
 
@@ -1454,7 +1460,7 @@ async def position_monitor():
 
     print("📈 Position monitor started")
     if TRAILING_STOP_ENABLED:
-        print(f"📈 Trailing stop enabled: {SWING_N} candle swing, {STOP_POINTS} buffer")
+        print(f"📈 Trailing stop enabled: {SWING_N} candle swing, {SL_BUFFER_PERCENT}% buffer")
 
     last_report_time = 0
     last_trail_update = {}  # {symbol: timestamp}
