@@ -267,13 +267,32 @@ class BybitTrader:
     def place_tp_sl(self, symbol, side, entry_price, tp_price=None, sl_price=None):
         """
         Place Take Profit and Stop Loss using Bybit's position TP/SL
-        - tp_price: Signal's VWAP target (required)
-        - sl_price: Signal's initial stop loss (will be trailed later)
+        - tp_price: Signal's VWAP target (uses fallback if None)
+        - sl_price: Signal's initial stop loss (uses swing-based if None)
         """
         try:
+            print(f"🔧 place_tp_sl called: side={side}, entry={entry_price}, tp={tp_price}, sl={sl_price}")
+
+            # Fallback: calculate SL from 1m swing if not provided
+            if sl_price is None:
+                print(f"🔧 SL is None, calculating from swing...")
+                sl_price = self.calc_trailing_sl(symbol, 'long' if side == 'buy' else 'short')
+                print(f"🔧 Swing SL result: {sl_price}")
+
+            # Fallback: calculate TP from percentage if not provided
+            if tp_price is None:
+                print(f"🔧 TP is None, using 3% fallback...")
+                if side == 'buy':
+                    tp_price = entry_price * 1.03
+                else:
+                    tp_price = entry_price * 0.97
+                print(f"🔧 Fallback TP: {tp_price}")
+
             if tp_price is None or sl_price is None:
-                print(f"⚠️ TP or SL not provided, skipping TP/SL setup")
+                print(f"❌ Could not calculate TP/SL: tp={tp_price}, sl={sl_price}")
                 return None
+
+            print(f"📊 Setting TP=${tp_price:.4f} / SL=${sl_price:.4f}")
 
             # Round prices
             market = self.exchange.market(symbol)
@@ -352,12 +371,13 @@ class BybitTrader:
 
             print(f"✅ Order filled at ${entry_price:.4f}")
 
-            # Place TP/SL using signal's target and stop loss
-            tp_sl = None
-            if tp_target and sl_initial:
+            # Place TP/SL (uses fallback if signal values not available)
+            if tp_target:
                 print(f"🎯 TP Target (VWAP): ${tp_target:.4f}")
+            if sl_initial:
                 print(f"🛑 SL Initial: ${sl_initial:.4f}")
-                tp_sl = self.place_tp_sl(symbol, side, entry_price, tp_target, sl_initial)
+
+            tp_sl = self.place_tp_sl(symbol, side, entry_price, tp_target, sl_initial)
 
             # Track position
             self.positions[symbol] = {
@@ -476,23 +496,7 @@ class BybitTrader:
     def update_position_sl(self, symbol, new_sl, current_tp=None):
         """Update stop-loss on Bybit position"""
         try:
-            # Robust symbol lookup
-            try:
-                market = self.exchange.market(symbol)
-                ccxt_symbol = market['symbol']
-            except Exception:
-                market = self.exchange.markets_by_id.get(symbol)
-                if not market:
-                    raise ValueError(f"Unknown symbol: {symbol}")
-                ccxt_symbol = market['symbol']
-
-            bybit_symbol = ccxt_symbol.replace('/USDT:USDT', 'USDT').replace(':USDT', '')
-
-            # Round price
-            price_precision = market.get('precision', {}).get('price', 2)
-            if isinstance(price_precision, float):
-                price_precision = int(price_precision) if price_precision > 0 else 2
-            new_sl = round(float(new_sl), price_precision)
+            bybit_symbol = symbol.replace('/USDT:USDT', 'USDT').replace(':USDT', '')
 
             params = {
                 'category': 'linear',
@@ -503,10 +507,8 @@ class BybitTrader:
                 'positionIdx': 0,
             }
 
-            # Include TP if provided (to avoid resetting it)
             if current_tp is not None:
-                tp = round(float(current_tp), price_precision)
-                params['takeProfit'] = str(tp)
+                params['takeProfit'] = str(current_tp)
                 params['tpTriggerBy'] = 'LastPrice'
 
             response = self.exchange.private_post_v5_position_trading_stop(params)
@@ -515,8 +517,8 @@ class BybitTrader:
             if ret_code == 0:
                 print(f"✅ SL updated to ${new_sl:.4f} for {bybit_symbol}")
                 return True
-            elif ret_code == 34040:  # "not modified" - SL is same, not an error
-                return True  # Silent success
+            elif ret_code == 34040:  # "not modified" - SL unchanged
+                return True
             else:
                 print(f"⚠️ SL update: {response.get('retMsg', response)}")
                 return False
