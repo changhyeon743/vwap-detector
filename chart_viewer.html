@@ -201,6 +201,8 @@ let chart, candleSeries, vwapLine, upperLine, lowerLine;
 let settings = {}, currentSymbol = '', currentTF = '5m';
 
 document.addEventListener('DOMContentLoaded', async () => {
+    // Wait for layout to be computed before initializing chart
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
     initChart();
     await loadSettings();
     await loadSymbols();

@@ -844,12 +844,12 @@ def start_chart_server():
                     ohlcv = api_exchange.fetch_ohlcv(symbol, timeframe, limit=500)
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-                    # Calculate VWAP
+                    # Calculate VWAP (for chart display only)
                     strategy = VWAPStrategy()
                     vwap_df = strategy.calculate_vwap(df.copy(), symbol, timeframe)
-                    df = pd.concat([df.reset_index(drop=True), vwap_df], axis=1)
+                    df_with_vwap = pd.concat([df.reset_index(drop=True), vwap_df], axis=1)
 
-                    # Check for signals on each bar
+                    # Check for signals on each bar (use raw df, check_signal calculates VWAP internally)
                     signals = []
                     for i in range(50, len(df)):
                         bar_df = df.iloc[:i+1].copy()
@@ -867,7 +867,7 @@ def start_chart_server():
                     upper_band_data = []
                     lower_band_data = []
 
-                    for _, row in df.iterrows():
+                    for _, row in df_with_vwap.iterrows():
                         time_sec = int(row['timestamp'] / 1000)
                         candles.append({
                             'time': time_sec,
