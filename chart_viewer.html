@@ -134,6 +134,10 @@
                 <button class="tf-btn" data-tf="15m">15m</button>
                 <button class="tf-btn" data-tf="1h">1h</button>
             </div>
+            <select class="symbol-select" id="tzSelect" style="width:70px;">
+                <option value="0">UTC</option>
+                <option value="9" selected>KST</option>
+            </select>
             <div class="status"><span class="status-dot" id="dot"></span><span id="statTxt">Connecting...</span></div>
         </div>
         <div id="chart-container">
@@ -200,7 +204,7 @@
 <script>
 let chart, candleSeries, vwapLine, upperLine, lowerLine;
 let settings = {}, currentSymbol = '', currentTF = '5m';
-const KST_OFFSET = 9 * 60 * 60; // UTC+9 in seconds
+function getTzOffset() { return parseInt(document.getElementById('tzSelect').value) * 3600; }
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Wait for layout to be computed before initializing chart
@@ -219,6 +223,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         loadChartData();
     }));
     document.getElementById('symbolSelect').addEventListener('change', e => { currentSymbol = e.target.value; loadChartData(); });
+    document.getElementById('tzSelect').addEventListener('change', () => loadChartData());
     document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => c.classList.toggle('on')));
 });
 
@@ -267,11 +272,11 @@ async function loadChartData() {
         const r = await fetch(`/api/ohlcv?symbol=${encodeURIComponent(currentSymbol)}&timeframe=${currentTF}`);
         if (r.ok) {
             const d = await r.json();
-            candleSeries.setData(d.candles.map(c => ({ time: c.time + KST_OFFSET, open: c.open, high: c.high, low: c.low, close: c.close })));
-            if (d.vwap) vwapLine.setData(d.vwap.map(v => ({ time: v.time + KST_OFFSET, value: v.value })));
-            if (d.upper_band) upperLine.setData(d.upper_band.map(v => ({ time: v.time + KST_OFFSET, value: v.value })));
-            if (d.lower_band) lowerLine.setData(d.lower_band.map(v => ({ time: v.time + KST_OFFSET, value: v.value })));
-            if (d.signals?.length) candleSeries.setMarkers(d.signals.map(s => ({ time: s.time + KST_OFFSET, position: s.type==='LONG'?'belowBar':'aboveBar', color: s.type==='LONG'?'#089981':'#f23645', shape: s.type==='LONG'?'arrowUp':'arrowDown', text: s.type })));
+            candleSeries.setData(d.candles.map(c => ({ time: c.time + getTzOffset(), open: c.open, high: c.high, low: c.low, close: c.close })));
+            if (d.vwap) vwapLine.setData(d.vwap.map(v => ({ time: v.time + getTzOffset(), value: v.value })));
+            if (d.upper_band) upperLine.setData(d.upper_band.map(v => ({ time: v.time + getTzOffset(), value: v.value })));
+            if (d.lower_band) lowerLine.setData(d.lower_band.map(v => ({ time: v.time + getTzOffset(), value: v.value })));
+            if (d.signals?.length) candleSeries.setMarkers(d.signals.map(s => ({ time: s.time + getTzOffset(), position: s.type==='LONG'?'belowBar':'aboveBar', color: s.type==='LONG'?'#089981':'#f23645', shape: s.type==='LONG'?'arrowUp':'arrowDown', text: s.type })));
             if (d.vwap?.length) { const l=d.vwap[d.vwap.length-1]; document.getElementById('lVwap').textContent=l.value.toFixed(2); }
             if (d.upper_band?.length) document.getElementById('lUp').textContent=d.upper_band[d.upper_band.length-1].value.toFixed(2);
             if (d.lower_band?.length) document.getElementById('lLo').textContent=d.lower_band[d.lower_band.length-1].value.toFixed(2);
