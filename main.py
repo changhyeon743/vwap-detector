@@ -1456,10 +1456,11 @@ class BybitMonitor:
             error_msg = f"""❌ <b>AUTO TRADE FAILED</b>
 
 <b>Symbol:</b> {clean_symbol}
+<b>Timeframe:</b> {timeframe}
 <b>Side:</b> {signal_type}
 <b>Error:</b> {error}"""
             send_telegram(error_msg)
-            print(f"❌ AUTO TRADE FAILED: {error}")
+            print(f"❌ AUTO TRADE FAILED [{timeframe}]: {error}")
 
     async def check_symbol(self, symbol):
         """Check a symbol across all timeframes"""

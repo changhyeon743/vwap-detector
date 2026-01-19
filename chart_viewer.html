@@ -200,6 +200,7 @@
 <script>
 let chart, candleSeries, vwapLine, upperLine, lowerLine;
 let settings = {}, currentSymbol = '', currentTF = '5m';
+const KST_OFFSET = 9 * 60 * 60; // UTC+9 in seconds
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Wait for layout to be computed before initializing chart
@@ -208,7 +209,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadSettings();
     await loadSymbols();
     await loadSignals();
-    setInterval(async () => { await loadChartData(); await loadSignals(); }, 30000);
+    // Auto-refresh disabled - manual refresh only
+    // setInterval(async () => { await loadChartData(); await loadSignals(); }, 30000);
 
     document.querySelectorAll('.tf-btn').forEach(b => b.addEventListener('click', () => {
         document.querySelectorAll('.tf-btn').forEach(x => x.classList.remove('active'));
@@ -265,11 +267,11 @@ async function loadChartData() {
         const r = await fetch(`/api/ohlcv?symbol=${encodeURIComponent(currentSymbol)}&timeframe=${currentTF}`);
         if (r.ok) {
             const d = await r.json();
-            candleSeries.setData(d.candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
-            if (d.vwap) vwapLine.setData(d.vwap.map(v => ({ time: v.time, value: v.value })));
-            if (d.upper_band) upperLine.setData(d.upper_band.map(v => ({ time: v.time, value: v.value })));
-            if (d.lower_band) lowerLine.setData(d.lower_band.map(v => ({ time: v.time, value: v.value })));
-            if (d.signals?.length) candleSeries.setMarkers(d.signals.map(s => ({ time: s.time, position: s.type==='LONG'?'belowBar':'aboveBar', color: s.type==='LONG'?'#089981':'#f23645', shape: s.type==='LONG'?'arrowUp':'arrowDown', text: s.type })));
+            candleSeries.setData(d.candles.map(c => ({ time: c.time + KST_OFFSET, open: c.open, high: c.high, low: c.low, close: c.close })));
+            if (d.vwap) vwapLine.setData(d.vwap.map(v => ({ time: v.time + KST_OFFSET, value: v.value })));
+            if (d.upper_band) upperLine.setData(d.upper_band.map(v => ({ time: v.time + KST_OFFSET, value: v.value })));
+            if (d.lower_band) lowerLine.setData(d.lower_band.map(v => ({ time: v.time + KST_OFFSET, value: v.value })));
+            if (d.signals?.length) candleSeries.setMarkers(d.signals.map(s => ({ time: s.time + KST_OFFSET, position: s.type==='LONG'?'belowBar':'aboveBar', color: s.type==='LONG'?'#089981':'#f23645', shape: s.type==='LONG'?'arrowUp':'arrowDown', text: s.type })));
             if (d.vwap?.length) { const l=d.vwap[d.vwap.length-1]; document.getElementById('lVwap').textContent=l.value.toFixed(2); }
             if (d.upper_band?.length) document.getElementById('lUp').textContent=d.upper_band[d.upper_band.length-1].value.toFixed(2);
             if (d.lower_band?.length) document.getElementById('lLo').textContent=d.lower_band[d.lower_band.length-1].value.toFixed(2);
@@ -285,7 +287,7 @@ async function loadSignals() {
             const d = await r.json();
             const list = document.getElementById('sigList');
             if (!d.signals?.length) { list.innerHTML = '<div class="sig-card"><div class="sym">No signals</div></div>'; return; }
-            list.innerHTML = d.signals.slice(0,20).map(s => `<div class="sig-card ${s.type.toLowerCase()}"><div class="sym">${s.symbol.replace('/USDT:USDT','').replace(':USDT','')}</div><div class="type">${s.type} @ ${s.timeframe}</div><div class="info">$${s.price?.toFixed(2)||'-'} | ${new Date(s.time).toLocaleTimeString()}</div></div>`).join('');
+            list.innerHTML = d.signals.slice(0,20).map(s => `<div class="sig-card ${s.type.toLowerCase()}"><div class="sym">${s.symbol.replace('/USDT:USDT','').replace(':USDT','')}</div><div class="type">${s.type} @ ${s.timeframe}</div><div class="info">$${s.price?.toFixed(2)||'-'} | ${new Date(s.time).toLocaleString('ko-KR', {timeZone:'Asia/Seoul', hour:'2-digit', minute:'2-digit'})}</div></div>`).join('');
         }
     } catch(e) {}
 }
