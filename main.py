@@ -340,6 +340,7 @@ class BybitTrader:
         self.exchange.load_time_difference()
         self.positions = {}  # Track open positions
         self.pending_signals = {}  # Signals waiting for user action
+        self._last_order_error = None  # Store last order error for debugging
 
     def set_leverage(self, symbol, leverage=None):
         """Set leverage for a symbol"""
@@ -415,7 +416,10 @@ class BybitTrader:
             print(f"✅ Market {side.upper()} order placed: {symbol} qty={quantity}")
             return order
         except Exception as e:
-            print(f"❌ Order failed: {e}")
+            error_msg = str(e)
+            print(f"❌ Order failed: {error_msg}")
+            # Store error for caller to access
+            self._last_order_error = error_msg
             return None
 
     def place_tp_sl(self, symbol, side, entry_price, tp_price=None, sl_price=None):
@@ -509,7 +513,8 @@ class BybitTrader:
             # Place market order
             order = self.place_market_order(symbol, side, quantity)
             if not order:
-                return None, "Market order failed"
+                error_detail = getattr(self, '_last_order_error', 'Unknown error')
+                return None, f"Market order failed: {error_detail}"
 
             # Get fill price (try multiple sources)
             entry_price = current_price  # Default fallback
