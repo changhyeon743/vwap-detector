@@ -989,7 +989,11 @@ def start_chart_server():
 
     try:
         port = settings.chart_server_port
-        with socketserver.TCPServer(("", port), APIHandler) as httpd:
+
+        class ReusableTCPServer(socketserver.TCPServer):
+            allow_reuse_address = True
+
+        with ReusableTCPServer(("", port), APIHandler) as httpd:
             print(f"📊 Dashboard: http://localhost:{port}/chart_viewer.html")
             httpd.serve_forever()
     except OSError as e:
