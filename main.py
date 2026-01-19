@@ -678,134 +678,6 @@ def init_trader():
         return False
 
 
-def generate_chart(df, symbol, timeframe, signal=None, save_path=None):
-    """Generate candlestick chart with VWAP and bands"""
-    # Use last 150 bars for wider time scale
-    df = df.tail(150).copy()
-    df = df.reset_index(drop=True)
-
-    # Convert timestamp to datetime in display timezone (for chart labels)
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-    tz = pytz.timezone(settings.display_timezone)
-    df['datetime'] = df['datetime'].dt.tz_convert(tz)
-
-    fig, ax = plt.subplots(figsize=(14, 8))
-
-    # Colors
-    up_color = '#26a69a'  # Green
-    down_color = '#ef5350'  # Red
-    vwap_color = '#2196f3'  # Blue
-    band_color = '#ff9800'  # Orange
-
-    # Plot candlesticks
-    width = 0.6
-    for i in range(len(df)):
-        row = df.iloc[i]
-        color = up_color if row['close'] >= row['open'] else down_color
-
-        # Wick
-        ax.plot([i, i], [row['low'], row['high']], color=color, linewidth=1)
-
-        # Body
-        body_bottom = min(row['open'], row['close'])
-        body_height = abs(row['close'] - row['open'])
-        if body_height == 0:
-            body_height = 0.001  # Doji
-        rect = Rectangle((i - width/2, body_bottom), width, body_height,
-                         facecolor=color, edgecolor=color)
-        ax.add_patch(rect)
-
-    # Plot VWAP
-    ax.plot(range(len(df)), df['vwap'], color=vwap_color, linewidth=2, label='VWAP')
-
-    # Plot bands
-    ax.plot(range(len(df)), df['upper_band'], color=band_color, linewidth=1.5,
-            linestyle='--', label=f'Upper Band ({settings.band_entry_mult}σ)')
-    ax.plot(range(len(df)), df['lower_band'], color=band_color, linewidth=1.5,
-            linestyle='--', label=f'Lower Band ({settings.band_entry_mult}σ)')
-
-    # Fill between bands
-    ax.fill_between(range(len(df)), df['upper_band'], df['lower_band'],
-                   alpha=0.1, color=band_color)
-
-    # Mark signal on last bar if present
-    if signal and signal.get('type'):
-        last_idx = len(df) - 1
-        last_row = df.iloc[-1]
-        if signal['type'] == 'LONG':
-            ax.scatter(last_idx, last_row['low'] * 0.998, marker='^',
-                      s=200, color='lime', edgecolors='black', zorder=5, label='LONG Signal')
-        elif signal['type'] == 'SHORT':
-            ax.scatter(last_idx, last_row['high'] * 1.002, marker='v',
-                      s=200, color='red', edgecolors='black', zorder=5, label='SHORT Signal')
-
-    # X-axis labels (show every 20th bar)
-    x_labels = []
-    x_ticks = []
-    for i in range(0, len(df), 20):
-        x_ticks.append(i)
-        x_labels.append(df.iloc[i]['datetime'].strftime('%H:%M'))
-    ax.set_xticks(x_ticks)
-    ax.set_xticklabels(x_labels, rotation=45)
-
-    # Labels and title
-    clean_symbol = symbol.replace(':USDT', '').replace('/USDT', '')
-    ax.set_title(f'{clean_symbol} - {timeframe} | VWAP Strategy', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Price')
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.3)
-
-    # Add current values as text
-    last = df.iloc[-1]
-    info_text = (f"Close: {last['close']:.4f}\n"
-                f"VWAP: {last['vwap']:.4f}\n"
-                f"Upper: {last['upper_band']:.4f}\n"
-                f"Lower: {last['lower_band']:.4f}")
-    ax.text(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=10,
-           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-    plt.tight_layout()
-
-    # Save chart
-    if save_path is None:
-        os.makedirs('charts', exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        signal_type = signal.get('type', '').lower() if signal else ''
-        save_path = f"charts/{clean_symbol}_{timeframe}_{signal_type}_{timestamp}.png"
-
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # Update charts index for HTML viewer
-    update_charts_index()
-
-    print(f"📈 Chart saved: {save_path}")
-    return save_path
-
-
-def update_charts_index():
-    """Update the charts/index.json file for the HTML viewer"""
-    import json
-    import glob
-
-    charts_dir = 'charts'
-    if not os.path.exists(charts_dir):
-        return
-
-    # Get all PNG files in charts directory
-    chart_files = glob.glob(os.path.join(charts_dir, '*.png'))
-    chart_files = [os.path.basename(f) for f in chart_files]
-
-    # Sort by modification time (newest first)
-    chart_files.sort(key=lambda f: os.path.getmtime(os.path.join(charts_dir, f)), reverse=True)
-
-    # Write index
-    index_path = os.path.join(charts_dir, 'index.json')
-    with open(index_path, 'w') as f:
-        json.dump({'charts': chart_files, 'updated': datetime.now().isoformat()}, f)
-
-
 def start_chart_server():
     """Start HTTP server for chart viewer and settings API"""
 
@@ -882,9 +754,9 @@ def start_chart_server():
                     vwap_df = strategy.calculate_vwap(df.copy(), symbol, timeframe)
                     df_with_vwap = pd.concat([df.reset_index(drop=True), vwap_df], axis=1)
 
-                    # Check for signals on each bar (use raw df, check_signal calculates VWAP internally)
+                    # Check for signals on each CLOSED bar (exclude last incomplete candle)
                     signals = []
-                    for i in range(50, len(df)):
+                    for i in range(50, len(df) - 1):  # -1 to exclude incomplete current candle
                         bar_df = df.iloc[:i+1].copy()
                         result = strategy.check_signal(bar_df, symbol, timeframe)
                         if result and result.get('type'):
@@ -1368,7 +1240,7 @@ class BybitMonitor:
 """
         return message
 
-    def send_signal_with_buttons(self, symbol, timeframe, signal, chart_path=None):
+    def send_signal_with_buttons(self, symbol, timeframe, signal):
         """Send signal with trade execution buttons"""
         message = self.format_signal_message(symbol, timeframe, signal)
 
@@ -1383,14 +1255,7 @@ class BybitMonitor:
             ]
         ]
 
-        if chart_path:
-            # Send photo with caption first, then buttons separately
-            send_telegram_photo(chart_path, message)
-            # Send buttons as a follow-up message
-            button_msg = f"👆 <b>Execute {signal_type} for {clean_symbol}?</b>"
-            send_telegram_with_buttons(button_msg, buttons)
-        else:
-            send_telegram_with_buttons(message, buttons)
+        send_telegram_with_buttons(message, buttons)
 
         # Store pending signal for callback handler (including TP/SL)
         if trader:
@@ -1406,7 +1271,7 @@ class BybitMonitor:
                 'timestamp': time.time()
             }
 
-    def auto_execute_trade(self, symbol, timeframe, signal, chart_path=None):
+    def auto_execute_trade(self, symbol, timeframe, signal):
         """Auto-execute trade immediately when signal detected"""
         global trader
 
@@ -1449,12 +1314,7 @@ class BybitMonitor:
 
 <i>Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"""
 
-            # Send chart if available
-            if chart_path:
-                send_telegram_photo(chart_path, msg)
-            else:
-                send_telegram(msg)
-
+            send_telegram(msg)
             print(f"✅ AUTO TRADE: {signal_type} executed at ${entry:.4f}")
         else:
             error_msg = f"""❌ <b>AUTO TRADE FAILED</b>
@@ -1521,28 +1381,13 @@ class BybitMonitor:
                         print(f"   TP: None (Exit Mode: {signal['exit_mode']})")
                     print(f"{'='*60}\n")
 
-                    # Generate and send chart with message and trade buttons
-                    chart_path = None
-                    if settings.send_chart:
-                        try:
-                            # Calculate VWAP data for chart
-                            df_chart = df.reset_index(drop=True)
-                            vwap_df = self.strategy.calculate_vwap(df_chart.copy(), symbol, timeframe)
-                            df_chart = pd.concat([df_chart, vwap_df], axis=1)
-
-                            # Generate chart
-                            chart_path = generate_chart(df_chart, symbol, timeframe, signal)
-                        except Exception as chart_err:
-                            print(f"⚠️ Chart generation failed: {chart_err}")
-                            chart_path = None
-
                     # Auto trade or send signal with buttons
                     if settings.auto_trade and trader:
                         # AUTO TRADE: Execute immediately
-                        self.auto_execute_trade(symbol, timeframe, signal, chart_path)
+                        self.auto_execute_trade(symbol, timeframe, signal)
                     else:
                         # Manual: Send signal with buttons
-                        self.send_signal_with_buttons(symbol, timeframe, signal, chart_path)
+                        self.send_signal_with_buttons(symbol, timeframe, signal)
 
                     # Add to signal history for HTML viewer
                     self.add_signal_to_history(symbol, timeframe, signal['type'])
